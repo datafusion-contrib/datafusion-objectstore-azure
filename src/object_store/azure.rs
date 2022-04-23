@@ -32,7 +32,8 @@ use datafusion_data_access::{
     object_store::{FileMetaStream, ListEntryStream, ObjectReader, ObjectStore},
     FileMeta, Result as DFAccessResult, SizedFile,
 };
-use futures::AsyncRead;
+use futures::{future::BoxFuture, AsyncRead, AsyncSeekExt};
+use range_reader::{RangeOutput, RangedAsyncReader};
 
 async fn new_client(account_name: String, account_key: String) -> DataLakeClient {
     let credential = StorageSharedKeyCredential::new(account_name, account_key);
@@ -73,7 +74,7 @@ impl AzureFileSystem {
 #[async_trait]
 impl ObjectStore for AzureFileSystem {
     async fn list_file(&self, prefix: &str) -> DFAccessResult<FileMetaStream> {
-        let (file_system, prefix) = match prefix.split_once("/") {
+        let (file_system, prefix) = match prefix.split_once('/') {
             Some((file_system, prefix)) => (file_system.to_owned(), prefix),
             None => (prefix.to_owned(), ""),
         };
@@ -116,7 +117,7 @@ impl ObjectStore for AzureFileSystem {
     }
 
     fn file_reader(&self, file: SizedFile) -> DFAccessResult<Arc<dyn ObjectReader>> {
-        let (file_system, path) = match file.path.split_once("/") {
+        let (file_system, path) = match file.path.split_once('/') {
             Some((file_system, prefix)) => Ok((file_system.to_owned(), prefix)),
             // We can never have a file at the root, since we expect the file system to be part of the path
             None => Err(io::Error::from(io::ErrorKind::InvalidInput)),
@@ -143,12 +144,38 @@ impl AzureFileReader {
 
 #[async_trait]
 impl ObjectReader for AzureFileReader {
-    async fn chunk_reader(
-        &self,
-        _start: u64,
-        _length: usize,
-    ) -> DFAccessResult<Box<dyn AsyncRead>> {
-        todo!("implement once async file readers are available (arrow-rs#78, arrow-rs#111)")
+    async fn chunk_reader(&self, start: u64, length: usize) -> DFAccessResult<Box<dyn AsyncRead>> {
+        let client = self.client.clone();
+
+        let range_get = Box::new(move |range_start: u64, range_length: usize| {
+            let get_object = client.read();
+
+            Box::pin(async move {
+                let get_object = get_object.clone();
+
+                let response = get_object
+                    .range(Range::new(range_start, range_start + range_length as u64))
+                    .into_future()
+                    .await;
+
+                let mut data = match response {
+                    Ok(res) => Ok(res.data),
+                    Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
+                }?
+                .to_vec();
+                data.truncate(range_length);
+                Ok(RangeOutput {
+                    start: range_start,
+                    data: data.to_vec(),
+                })
+            }) as BoxFuture<'static, std::io::Result<RangeOutput>>
+        });
+
+        // at least 4kb per request
+        let mut reader = RangedAsyncReader::new(length, 4 * 1024, range_get);
+        reader.seek(std::io::SeekFrom::Start(start)).await?;
+
+        Ok(Box::new(reader))
     }
 
     fn sync_chunk_reader(
@@ -208,7 +235,6 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::prelude::SessionContext;
     use futures::StreamExt;
-    use http::Uri;
 
     // Test that `AzureFileSystem` can read files
     #[tokio::test]
