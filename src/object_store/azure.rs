@@ -55,15 +55,17 @@ pub struct AzureFileSystem {
 }
 
 impl AzureFileSystem {
-    /// Create new `ObjectStore`
-    pub async fn new<A>(account_name: A, account_key: String) -> Self
+    /// Create new `AzureFileSystem`
+    pub async fn new<A, K>(account_name: A, account_key: K) -> Self
     where
         A: Into<String>,
+        K: Into<String>,
     {
         let account: String = account_name.into();
+        let key: String = account_key.into();
         Self {
-            client: new_client(account.clone(), account_key.clone()).await,
-            storage_client: new_blob_client(account, account_key).await,
+            client: new_client(account.clone(), key.clone()).await,
+            storage_client: new_blob_client(account, key).await,
         }
     }
 }
@@ -76,41 +78,33 @@ impl ObjectStore for AzureFileSystem {
             None => (prefix.to_owned(), ""),
         };
 
-        // TODO we need to use this function once https://github.com/Azure/azure-sdk-for-rust/issues/720
-        // is resolved, or implement pagination in the current implementation.
-        // let this = self.client.clone();
-        // let stream = this
-        //     .into_file_system_client(file_system)
-        //     .list_paths()
-        //     .directory(prefix)
-        //     .into_stream()
-        //     .flat_map(|f| convert(f.unwrap()));
-        // Ok(Box::pin(stream))
-
-        let container_client = self.storage_client.as_container_client(file_system);
+        // TODO use datalake client once https://github.com/Azure/azure-sdk-for-rust/issues/720 is resolved
+        let container_client = self.storage_client.as_container_client(&file_system);
         let objs = container_client
             .list_blobs()
             .prefix(prefix)
             .execute()
             .await
-            .unwrap()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
             .blobs
             .blobs
             .into_iter()
-            .map(|blob| {
+            .filter_map(|blob| {
                 let sized_file = SizedFile {
                     size: blob.properties.content_length,
-                    path: blob.name,
+                    path: format!("{}/{}", &file_system, blob.name),
                 };
-                Ok(FileMeta {
-                    sized_file,
-                    last_modified: Some(blob.properties.last_modified),
-                })
+                if sized_file.size > 0 {
+                    Some(Ok(FileMeta {
+                        sized_file,
+                        last_modified: Some(blob.properties.last_modified),
+                    }))
+                } else {
+                    None
+                }
             })
             .collect::<Vec<Result<FileMeta, _>>>();
-
-        let output = futures::stream::iter(objs);
-        Ok(Box::pin(output))
+        Ok(Box::pin(futures::stream::iter(objs)))
     }
 
     async fn list_dir(
@@ -122,11 +116,16 @@ impl ObjectStore for AzureFileSystem {
     }
 
     fn file_reader(&self, file: SizedFile) -> DFAccessResult<Arc<dyn ObjectReader>> {
+        let (file_system, path) = match file.path.split_once("/") {
+            Some((file_system, prefix)) => Ok((file_system.to_owned(), prefix)),
+            // We can never have a file at the root, since we expect the file system to be part of the path
+            None => Err(io::Error::from(io::ErrorKind::InvalidInput)),
+        }?;
         let client = self
             .client
             .clone()
-            .into_file_system_client("file_system_name")
-            .into_file_client("path");
+            .into_file_system_client(file_system)
+            .into_file_client(path);
         Ok(Arc::new(AzureFileReader::new(client, file)?))
     }
 }
@@ -157,7 +156,7 @@ impl ObjectReader for AzureFileReader {
         start: u64,
         length: usize,
     ) -> DFAccessResult<Box<dyn Read + Send + Sync>> {
-        let file_path = self.file.path.clone();
+        // let file_path = self.file.path.clone();
         let client = self.client.clone();
 
         // once the async chunk file readers have been implemented this complexity can be removed
@@ -169,16 +168,11 @@ impl ObjectReader for AzureFileReader {
                 .unwrap();
 
             rt.block_on(async move {
-                let (file_system, prefix) = match file_path.split_once("/") {
-                    Some((file_system, prefix)) => (file_system.to_owned(), prefix),
-                    None => (file_path.to_owned(), ""),
-                };
-
                 let get_object = client.read();
                 let resp = if length > 0 {
                     // range bytes requests are inclusive
                     get_object
-                        .range(Range::new(start, start + (length - 1) as u64))
+                        .range(Range::new(start, start + length as u64))
                         .into_future()
                         .await
                 } else {
@@ -187,8 +181,7 @@ impl ObjectReader for AzureFileReader {
 
                 let bytes = match resp {
                     Ok(res) => Ok(res.data),
-                    // TODO more precise error
-                    Err(err) => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                    Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
                 };
 
                 tx.send(bytes).unwrap();
@@ -197,8 +190,7 @@ impl ObjectReader for AzureFileReader {
 
         let bytes = rx
             .recv_timeout(Duration::from_secs(10))
-            // TODO more precise error
-            .map_err(|err| io::Error::from(io::ErrorKind::ConnectionRefused))??;
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))??;
 
         Ok(Box::new(bytes.reader()))
     }
@@ -208,317 +200,228 @@ impl ObjectReader for AzureFileReader {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use crate::object_store::azure::*;
-//     use datafusion::assert_batches_eq;
-//     use datafusion::datasource::listing::*;
-//     use datafusion::datasource::TableProvider;
-//     use datafusion::prelude::SessionContext;
-//     use futures::StreamExt;
-//     use http::Uri;
-//
-//     const ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
-//     const SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-//     const PROVIDER_NAME: &str = "Static";
-//     const MINIO_ENDPOINT: &str = "http://localhost:9000";
-//
-//     // Test that `AzureFileSystem` can read files
-//     #[tokio::test]
-//     async fn test_read_files() -> Result<()> {
-//         let azure_file_system = AzureFileSystem::new(
-//             Some(SharedCredentialsProvider::new(Credentials::new(
-//                 ACCESS_KEY_ID,
-//                 SECRET_ACCESS_KEY,
-//                 None,
-//                 None,
-//                 PROVIDER_NAME,
-//             ))),
-//             None,
-//             Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//             None,
-//             None,
-//             None,
-//         )
-//         .await;
-//
-//         let mut files = azure_file_system.list_file("data").await?;
-//
-//         while let Some(file) = files.next().await {
-//             let sized_file = file.unwrap().sized_file;
-//             let mut reader = azure_file_system
-//                 .file_reader(sized_file.clone())
-//                 .unwrap()
-//                 .sync_chunk_reader(0, sized_file.size as usize)
-//                 .unwrap();
-//
-//             let mut bytes = Vec::new();
-//             let size = reader.read_to_end(&mut bytes)?;
-//
-//             assert_eq!(size as u64, sized_file.size);
-//         }
-//
-//         Ok(())
-//     }
-//
-//     // Test that reading files with `AzureFileSystem` produces the expected results
-//     #[tokio::test]
-//     async fn test_read_range() -> Result<()> {
-//         let start = 10;
-//         let length = 128;
-//
-//         let mut file = std::fs::File::open("parquet-testing/data/alltypes_plain.snappy.parquet")?;
-//         let mut raw_bytes = Vec::new();
-//         file.read_to_end(&mut raw_bytes)?;
-//         let raw_slice = &raw_bytes[start..start + length];
-//         assert_eq!(raw_slice.len(), length);
-//
-//         let azure_file_system = AzureFileSystem::new(
-//             Some(SharedCredentialsProvider::new(Credentials::new(
-//                 ACCESS_KEY_ID,
-//                 SECRET_ACCESS_KEY,
-//                 None,
-//                 None,
-//                 PROVIDER_NAME,
-//             ))),
-//             None,
-//             Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//             None,
-//             None,
-//             None,
-//         )
-//         .await;
-//         let mut files = azure_file_system
-//             .list_file("data/alltypes_plain.snappy.parquet")
-//             .await?;
-//
-//         if let Some(file) = files.next().await {
-//             let sized_file = file.unwrap().sized_file;
-//             let mut reader = azure_file_system
-//                 .file_reader(sized_file)
-//                 .unwrap()
-//                 .sync_chunk_reader(start as u64, length)
-//                 .unwrap();
-//
-//             let mut reader_bytes = Vec::new();
-//             let size = reader.read_to_end(&mut reader_bytes)?;
-//
-//             assert_eq!(size, length);
-//             assert_eq!(&reader_bytes, raw_slice);
-//         }
-//
-//         Ok(())
-//     }
-//
-//     // Test that reading Parquet file with `AzureFileSystem` can create a `ListingTable`
-//     #[tokio::test]
-//     async fn test_read_parquet() -> Result<()> {
-//         let azure_file_system = Arc::new(
-//             AzureFileSystem::new(
-//                 Some(SharedCredentialsProvider::new(Credentials::new(
-//                     ACCESS_KEY_ID,
-//                     SECRET_ACCESS_KEY,
-//                     None,
-//                     None,
-//                     PROVIDER_NAME,
-//                 ))),
-//                 None,
-//                 Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//                 None,
-//                 None,
-//                 None,
-//             )
-//             .await,
-//         );
-//
-//         let filename = "data/alltypes_plain.snappy.parquet";
-//
-//         let config = ListingTableConfig::new(azure_file_system, filename)
-//             .infer()
-//             .await?;
-//
-//         let table = ListingTable::try_new(config)?;
-//
-//         let exec = table.scan(&None, &[], Some(1024)).await?;
-//         assert_eq!(exec.statistics().num_rows, Some(2));
-//
-//         Ok(())
-//     }
-//
-//     // Test that a SQL query can be executed on a Parquet file that was read from `AzureFileSystem`
-//     #[tokio::test]
-//     async fn test_sql_query() -> Result<()> {
-//         let azure_file_system = Arc::new(
-//             AzureFileSystem::new(
-//                 Some(SharedCredentialsProvider::new(Credentials::new(
-//                     ACCESS_KEY_ID,
-//                     SECRET_ACCESS_KEY,
-//                     None,
-//                     None,
-//                     PROVIDER_NAME,
-//                 ))),
-//                 None,
-//                 Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//                 None,
-//                 None,
-//                 None,
-//             )
-//             .await,
-//         );
-//
-//         let filename = "data/alltypes_plain.snappy.parquet";
-//
-//         let config = ListingTableConfig::new(azure_file_system, filename)
-//             .infer()
-//             .await?;
-//
-//         let table = ListingTable::try_new(config)?;
-//
-//         let mut ctx = ExecutionContext::new();
-//
-//         ctx.register_table("tbl", Arc::new(table)).unwrap();
-//
-//         let batches = ctx.sql("SELECT * FROM tbl").await?.collect().await?;
-//         let expected = vec![
-//         "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+",
-//         "| id | bool_col | tinyint_col | smallint_col | int_col | bigint_col | float_col | double_col | date_string_col  | string_col | timestamp_col       |",
-//         "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+",
-//         "| 6  | true     | 0           | 0            | 0       | 0          | 0         | 0          | 30342f30312f3039 | 30         | 2009-04-01 00:00:00 |",
-//         "| 7  | false    | 1           | 1            | 1       | 10         | 1.1       | 10.1       | 30342f30312f3039 | 31         | 2009-04-01 00:01:00 |",
-//         "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+"
-//         ];
-//         assert_batches_eq!(expected, &batches);
-//         Ok(())
-//     }
-//
-//     // Test that the AzureFileSystem allows reading from different buckets
-//     #[tokio::test]
-//     #[should_panic(expected = "Could not parse metadata: bad data")]
-//     async fn test_read_alternative_bucket() {
-//         let azure_file_system = Arc::new(
-//             AzureFileSystem::new(
-//                 Some(SharedCredentialsProvider::new(Credentials::new(
-//                     ACCESS_KEY_ID,
-//                     SECRET_ACCESS_KEY,
-//                     None,
-//                     None,
-//                     PROVIDER_NAME,
-//                 ))),
-//                 None,
-//                 Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//                 None,
-//                 None,
-//                 None,
-//             )
-//             .await,
-//         );
-//
-//         let filename = "bad_data/PARQUET-1481.parquet";
-//
-//         let config = ListingTableConfig::new(azure_file_system, filename)
-//             .infer()
-//             .await
-//             .unwrap();
-//
-//         let table = ListingTable::try_new(config).unwrap();
-//
-//         table.scan(&None, &[], Some(1024)).await.unwrap();
-//     }
-//
-//     // Test that `AzureFileSystem` can be registered as object store on a DataFusion `ExecutionContext`
-//     #[tokio::test]
-//     async fn test_ctx_register_object_store() -> Result<()> {
-//         let azure_file_system = Arc::new(
-//             AzureFileSystem::new(
-//                 Some(SharedCredentialsProvider::new(Credentials::new(
-//                     ACCESS_KEY_ID,
-//                     SECRET_ACCESS_KEY,
-//                     None,
-//                     None,
-//                     PROVIDER_NAME,
-//                 ))),
-//                 None,
-//                 Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//                 None,
-//                 None,
-//                 None,
-//             )
-//             .await,
-//         );
-//
-//         let ctx = ExecutionContext::new();
-//
-//         ctx.register_object_store("s3", azure_file_system);
-//
-//         let (_, name) = ctx.object_store("s3").unwrap();
-//         assert_eq!(name, "s3");
-//
-//         Ok(())
-//     }
-//
-//     // Test that an appropriate error message is produced for a non existent bucket
-//     #[tokio::test]
-//     #[should_panic(expected = "NoSuchBucket")]
-//     async fn test_read_nonexistent_bucket() {
-//         let azure_file_system = AzureFileSystem::new(
-//             Some(SharedCredentialsProvider::new(Credentials::new(
-//                 ACCESS_KEY_ID,
-//                 SECRET_ACCESS_KEY,
-//                 None,
-//                 None,
-//                 PROVIDER_NAME,
-//             ))),
-//             None,
-//             Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//             None,
-//             None,
-//             None,
-//         )
-//         .await;
-//
-//         let mut files = azure_file_system
-//             .list_file("nonexistent_data")
-//             .await
-//             .unwrap();
-//
-//         while let Some(file) = files.next().await {
-//             let sized_file = file.unwrap().sized_file;
-//             let mut reader = azure_file_system
-//                 .file_reader(sized_file.clone())
-//                 .unwrap()
-//                 .sync_chunk_reader(0, sized_file.size as usize)
-//                 .unwrap();
-//
-//             let mut bytes = Vec::new();
-//             let size = reader.read_to_end(&mut bytes).unwrap();
-//
-//             assert_eq!(size as u64, sized_file.size);
-//         }
-//     }
-//
-//     // Test that no files are returned if a non existent file URI is provided
-//     #[tokio::test]
-//     async fn test_read_nonexistent_file() {
-//         let azure_file_system = AzureFileSystem::new(
-//             Some(SharedCredentialsProvider::new(Credentials::new(
-//                 ACCESS_KEY_ID,
-//                 SECRET_ACCESS_KEY,
-//                 None,
-//                 None,
-//                 PROVIDER_NAME,
-//             ))),
-//             None,
-//             Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
-//             None,
-//             None,
-//             None,
-//         )
-//         .await;
-//         let mut files = azure_file_system
-//             .list_file("data/nonexistent_file.txt")
-//             .await
-//             .unwrap();
-//
-//         assert!(files.next().await.is_none())
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::assert_batches_eq;
+    use datafusion::datasource::listing::*;
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
+    use http::Uri;
+
+    // Test that `AzureFileSystem` can read files
+    #[tokio::test]
+    async fn test_read_files() -> DFAccessResult<()> {
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = AzureFileSystem::new(account_name, account_key).await;
+
+        let mut files = azure_file_system.list_file("parquet-testing-data").await?;
+
+        while let Some(file) = files.next().await {
+            let sized_file = file.unwrap().sized_file;
+            println!("{:?}", sized_file);
+            let mut reader = azure_file_system
+                .file_reader(sized_file.clone())
+                .unwrap()
+                .sync_chunk_reader(0, sized_file.size as usize)
+                .unwrap();
+
+            let mut bytes = Vec::new();
+            let size = reader.read_to_end(&mut bytes)?;
+
+            assert_eq!(size as u64, sized_file.size);
+        }
+
+        Ok(())
+    }
+
+    // Test that reading files with `AzureFileSystem` produces the expected results
+    #[tokio::test]
+    async fn test_read_range() -> DFAccessResult<()> {
+        let start = 10;
+        let length = 128;
+
+        let mut file = std::fs::File::open("parquet-testing/data/alltypes_plain.snappy.parquet")?;
+        let mut raw_bytes = Vec::new();
+        file.read_to_end(&mut raw_bytes)?;
+        let raw_slice = &raw_bytes[start..start + length];
+        assert_eq!(raw_slice.len(), length);
+
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = AzureFileSystem::new(account_name, account_key).await;
+
+        let mut files = azure_file_system
+            .list_file("parquet-testing-data/alltypes_plain.snappy.parquet")
+            .await?;
+
+        if let Some(file) = files.next().await {
+            let sized_file = file.unwrap().sized_file;
+            let mut reader = azure_file_system
+                .file_reader(sized_file)
+                .unwrap()
+                .sync_chunk_reader(start as u64, length)
+                .unwrap();
+
+            let mut reader_bytes = Vec::new();
+            let size = reader.read_to_end(&mut reader_bytes)?;
+
+            assert_eq!(size, length);
+            assert_eq!(&reader_bytes, raw_slice);
+        }
+
+        Ok(())
+    }
+
+    // Test that reading Parquet file with `AzureFileSystem` can create a `ListingTable`
+    #[tokio::test]
+    async fn test_read_parquet() -> DFAccessResult<()> {
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = Arc::new(AzureFileSystem::new(account_name, account_key).await);
+
+        let filename = "parquet-testing-data/alltypes_plain.snappy.parquet";
+
+        let config = ListingTableConfig::new(azure_file_system, filename)
+            .infer()
+            .await
+            .unwrap();
+
+        let table = ListingTable::try_new(config).unwrap();
+
+        let exec = table.scan(&None, &[], Some(1024)).await.unwrap();
+        assert_eq!(exec.statistics().num_rows, Some(2));
+
+        Ok(())
+    }
+
+    // Test that a SQL query can be executed on a Parquet file that was read from `AzureFileSystem`
+    #[tokio::test]
+    async fn test_sql_query() -> DFAccessResult<()> {
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = Arc::new(AzureFileSystem::new(account_name, account_key).await);
+        let filename = "parquet-testing-data/alltypes_plain.snappy.parquet";
+
+        let config = ListingTableConfig::new(azure_file_system, filename)
+            .infer()
+            .await
+            .unwrap();
+
+        let table = ListingTable::try_new(config).unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("tbl", Arc::new(table)).unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM tbl")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let expected = vec![
+        "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+",
+        "| id | bool_col | tinyint_col | smallint_col | int_col | bigint_col | float_col | double_col | date_string_col  | string_col | timestamp_col       |",
+        "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+",
+        "| 6  | true     | 0           | 0            | 0       | 0          | 0         | 0          | 30342f30312f3039 | 30         | 2009-04-01 00:00:00 |",
+        "| 7  | false    | 1           | 1            | 1       | 10         | 1.1       | 10.1       | 30342f30312f3039 | 31         | 2009-04-01 00:01:00 |",
+        "+----+----------+-------------+--------------+---------+------------+-----------+------------+------------------+------------+---------------------+"
+        ];
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    // Test that the AzureFileSystem allows reading from different buckets
+    // #[tokio::test]
+    // #[should_panic(expected = "Could not parse metadata: bad data")]
+    // async fn test_read_alternative_bucket() {
+    //     let account_name = crate::test_utils::get_account();
+    //     let account_key = crate::test_utils::get_key();
+    //     let azure_file_system = Arc::new(AzureFileSystem::new(account_name, account_key).await);
+    //     let filename = "parquet-testing-bad-data/PARQUET-1481.parquet";
+    //
+    //     let config = ListingTableConfig::new(azure_file_system, filename)
+    //         .infer()
+    //         .await
+    //         .unwrap();
+    //
+    //     let table = ListingTable::try_new(config).unwrap();
+    //
+    //     table.scan(&None, &[], Some(1024)).await.unwrap();
+    // }
+
+    // Test that `AzureFileSystem` can be registered as object store on a DataFusion `ExecutionContext`
+    #[tokio::test]
+    async fn test_ctx_register_object_store() -> DFAccessResult<()> {
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = Arc::new(AzureFileSystem::new(account_name, account_key).await);
+
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store("adls2", azure_file_system);
+
+        let (_, name) = ctx.runtime_env().object_store("adls2").unwrap();
+        assert_eq!(name, "adls2");
+
+        Ok(())
+    }
+
+    //     // Test that an appropriate error message is produced for a non existent bucket
+    //     #[tokio::test]
+    //     #[should_panic(expected = "NoSuchBucket")]
+    //     async fn test_read_nonexistent_bucket() {
+    //         let azure_file_system = AzureFileSystem::new(
+    //             Some(SharedCredentialsProvider::new(Credentials::new(
+    //                 ACCESS_KEY_ID,
+    //                 SECRET_ACCESS_KEY,
+    //                 None,
+    //                 None,
+    //                 PROVIDER_NAME,
+    //             ))),
+    //             None,
+    //             Some(Endpoint::immutable(Uri::from_static(MINIO_ENDPOINT))),
+    //             None,
+    //             None,
+    //             None,
+    //         )
+    //         .await;
+    //
+    //         let mut files = azure_file_system
+    //             .list_file("nonexistent_data")
+    //             .await
+    //             .unwrap();
+    //
+    //         while let Some(file) = files.next().await {
+    //             let sized_file = file.unwrap().sized_file;
+    //             let mut reader = azure_file_system
+    //                 .file_reader(sized_file.clone())
+    //                 .unwrap()
+    //                 .sync_chunk_reader(0, sized_file.size as usize)
+    //                 .unwrap();
+    //
+    //             let mut bytes = Vec::new();
+    //             let size = reader.read_to_end(&mut bytes).unwrap();
+    //
+    //             assert_eq!(size as u64, sized_file.size);
+    //         }
+    //     }
+
+    // Test that no files are returned if a non existent file URI is provided
+    #[tokio::test]
+    async fn test_read_nonexistent_file() {
+        let account_name = crate::test_utils::get_account();
+        let account_key = crate::test_utils::get_key();
+        let azure_file_system = Arc::new(AzureFileSystem::new(account_name, account_key).await);
+
+        let mut files = azure_file_system
+            .list_file("parquet-testing-data/nonexistent_file.txt")
+            .await
+            .unwrap();
+
+        assert!(files.next().await.is_none())
+    }
+}

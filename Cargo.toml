@@ -1,8 +1,8 @@
 [package]
 edition = "2021"
 name = "datafusion-objectstore-azure"
-description = "Azure as an ObjectStore for Datafusion"
-version = "0.1.0"
+description = "Azure Storage as an ObjectStore for Datafusion"
+version = "0.0.1"
 homepage = "https://github.com/datafusion-contrib/datafusion-objectstore-azure"
 repository = "https://github.com/datafusion-contrib/datafusion-objectstore-azure"
 readme = "README.md"
@@ -17,22 +17,26 @@ name = "datafusion_objectstore_azure"
 path = "src/lib.rs"
 
 [dependencies]
-azure_core = { git = "https://github.com/roeap/azure-sdk-for-rust", branch = "fix-range" }
-azure_storage = { git = "https://github.com/roeap/azure-sdk-for-rust", branch = "fix-range" }
-azure_storage_blobs = { git = "https://github.com/roeap/azure-sdk-for-rust", branch = "fix-range" }
-azure_storage_datalake = { git = "https://github.com/roeap/azure-sdk-for-rust", branch = "fix-range" }
+azure_core = { git = "https://github.com/Azure/azure-sdk-for-rust", rev = "89e9f7189daf847b88b7e0b766ab52d69d546044" }
+azure_storage = { git = "https://github.com/Azure/azure-sdk-for-rust", rev = "89e9f7189daf847b88b7e0b766ab52d69d546044" }
+azure_storage_blobs = { git = "https://github.com/Azure/azure-sdk-for-rust", rev = "89e9f7189daf847b88b7e0b766ab52d69d546044" }
+azure_storage_datalake = { git = "https://github.com/Azure/azure-sdk-for-rust", rev = "89e9f7189daf847b88b7e0b766ab52d69d546044" }
 
-arrow = { version = "11.0.0", features = ["prettyprint"] }
+arrow = { version = "12.0.0", features = ["prettyprint"] }
 async-trait = "0.1.52"
 bytes = "1.1.0"
-datafusion-data-access = { git = "https://github.com/apache/arrow-datafusion.git", rev = "f619d43494e182e260423f8333eed9ea789f0cb8" }
+datafusion-data-access = { git = "https://github.com/apache/arrow-datafusion.git", rev = "886735304f0fa83a24ddc3b3e356aeff4aab78f2" }
 futures = "0.3.19"
 http = "0.2.6"
 num_cpus = "1.13.1"
-tokio = { version = "1.0", features = [
+tokio = { version = "^1", features = [
   "macros",
   "rt",
   "rt-multi-thread",
   "sync",
   "fs",
 ] }
+
+[dev-dependencies]
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "886735304f0fa83a24ddc3b3e356aeff4aab78f2" }
+dotenv = "*"
