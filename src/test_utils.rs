@@ -1,9 +1,9 @@
 // #![cfg(feature = "mock_transport_framework")]
-use azure_core::ClientOptions;
-use azure_storage::storage_shared_key_credential::StorageSharedKeyCredential;
-use azure_storage_datalake::prelude::*;
+// use azure_core::ClientOptions;
+// use azure_storage::storage_shared_key_credential::StorageSharedKeyCredential;
+// use azure_storage_datalake::prelude::*;
 use dotenv::dotenv;
-use std::error::Error;
+// use std::error::Error;
 
 // pub async fn create_data_lake_client(
 //     transaction_name: &str,
