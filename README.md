@@ -65,7 +65,14 @@ let mut table_provider: Arc<dyn TableProvider + Send + Sync> = Arc::new(ListingT
 
 ## Testing
 
-Clone the test data repository:
+For testing we aim to support the `mock_testing_framework` used within the
+[`azure-sdk-for-rust`](https://github.com/Azure/azure-sdk-for-rust), however right now we
+still need to use the blob client for which the testing framework is not yet implemented.
+
+As no appropriate mocking server exists for the ADLS Gen2 storage accounts, tests need to be executed
+locally, against a storage account provided by the developer.
+
+First clone the test data repository:
 
 ```bash
 git submodule update --init --recursive
@@ -77,14 +84,7 @@ When this does not work, manually run the following:
 git submodule add -f https://github.com/apache/parquet-testing.git parquet-testing
 ```
 
-For testing we aim to support the `mock_testing_framework` used within the
-[`azure-sdk-for-rust`](https://github.com/Azure/azure-sdk-for-rust), however right now we
-still need to use the blob client for which the testing framework is not yet implemented.
-
-As no appropriate mocking server exists for the ADLS Gen2 storage accounts, tests need to be executed
-locally, against a storage account provided by the developer.
-
-Create a container in your storage account:
+Then create a container in your storage account:
 
 ```bash
 # create the AZURE_STORAGE_ACCOUNT 'datafusion'
@@ -108,11 +108,7 @@ AZURE_STORAGE_ACCOUNT="..."
 AZURE_STORAGE_KEY="..."
 ```
 
-
-
-
-
-then execute the tests
+Then execute the tests
 
 ```sh
 cargo test
