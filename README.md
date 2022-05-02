@@ -91,10 +91,14 @@ Create a container in your storage account:
 az storage account create --resource-group datafusion --kind StorageV2 --location westeurope --sku Standard_LRS --name datafusion
 # fetch the AZURE_STORAGE_KEY
 az storage account keys list -g datafusion -n datafusion | jq -r ".[0].value"
-# create a storage container 'parquet-testing-data'
+
+# create and fill container with data
 az storage container create --resource-group datafusion --account-name datafusion --public-access container --name parquet-testing-data
-# upload the testing data into the container
 az storage blob directory upload --account-name datafusion --container parquet-testing-data -s "./parquet-testing/data/*" -d . --recursive
+
+# create and fill container for bad_data
+az storage container create --resource-group datafusion --account-name datafusion --public-access container --name parquet-testing-bad-data
+az storage blob directory upload --account-name datafusion --container parquet-testing-bad-data -s "./parquet-testing/bad_data/*" -d . --recursive
 ```
 
 Place a file called `.env` in the root of the repo (this is ignored by `.gitignore`) and store provide credentials
