@@ -65,6 +65,18 @@ let mut table_provider: Arc<dyn TableProvider + Send + Sync> = Arc::new(ListingT
 
 ## Testing
 
+Clone the test data repository:
+
+```bash
+git submodule update --init --recursive
+```
+
+When this does not work, manually run the following:
+
+```bash
+git submodule add -f https://github.com/apache/parquet-testing.git parquet-testing
+```
+
 For testing we aim to support the `mock_testing_framework` used within the
 [`azure-sdk-for-rust`](https://github.com/Azure/azure-sdk-for-rust), however right now we
 still need to use the blob client for which the testing framework is not yet implemented.
@@ -72,12 +84,29 @@ still need to use the blob client for which the testing framework is not yet imp
 As no appropriate mocking server exists for the ADLS Gen2 storage accounts, tests need to be executed
 locally, against a storage account provided by the developer.
 
+Create a container in your storage account:
+
+```bash
+# create the AZURE_STORAGE_ACCOUNT 'datafusion'
+az storage account create --resource-group datafusion --kind StorageV2 --location westeurope --sku Standard_LRS --name datafusion
+# fetch the AZURE_STORAGE_KEY
+az storage account keys list -g datafusion -n datafusion | jq -r ".[0].value"
+# create a storage container 'parquet-testing-data'
+az storage container create --resource-group datafusion --account-name datafusion --public-access container --name parquet-testing-data
+# upload the testing data into the container
+az storage blob directory upload --account-name datafusion --container parquet-testing-data -s "./parquet-testing/data/*" -d . --recursive
+```
+
 Place a file called `.env` in the root of the repo (this is ignored by `.gitignore`) and store provide credentials
 
 ```toml
 AZURE_STORAGE_ACCOUNT="..."
 AZURE_STORAGE_KEY="..."
 ```
+
+
+
+
 
 then execute the tests
 
