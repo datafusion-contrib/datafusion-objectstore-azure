@@ -1,6 +1,6 @@
 # DataFusion-ObjectStore-Azure
 
-🚨 WARNING 🚨: This crate is still experimental.
+🚨 WARNING 🚨: This project is archived, as datafusion has moved to the object_store crate, which natively supports Azure.
 
 Azure storage account as an ObjectStore for [Datafusion](https://github.com/apache/arrow-datafusion).
 
